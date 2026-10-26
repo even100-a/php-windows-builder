@@ -1,0 +1,259 @@
+name: Build PHP 7.2 x64 TS Apache (CVE patched)
+run-name: PHP72-CVE-x64-TS-Apache
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PHP72_SOURCE_REF: php-7.2.34
+      PHP72_ROOT: C:\p72
+      PHP72_LOG_DIR: C:\p72\logs
+      PHP_BUILD_PROVIDER: Custom PHP 7.2.34 with meuhland community backport
+      SBOM: 'false'
+
+    steps:
+      # Put this workflow in a fork of php/php-windows-builder.
+      - name: Checkout your builder fork
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Checkout the requested PHP security branch
+        uses: actions/checkout@v6
+        with:
+          repository: php/php-src
+          ref: php-7.2.34
+          path: security-source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout pinned community backports
+        uses: actions/checkout@v6
+        with:
+          repository: meuhland/php-legacy-windows-builds
+          ref: 01c04b75b6bcb8eb1730e639be50ff707ef0fc01
+          path: legacy-patches
+          persist-credentials: false
+
+      - name: Apply all four PHP 7.2 backport patches
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = "$env:GITHUB_WORKSPACE\security-source"
+          $patches = @(Get-ChildItem "$env:GITHUB_WORKSPACE\legacy-patches\patches\7.2\*.patch" | Sort-Object Name)
+          if ($patches.Count -ne 4) { throw 'Expected exactly four pinned PHP 7.2 patches' }
+          foreach ($patch in $patches) {
+            & git -C $source apply --check $patch.FullName
+            if ($LASTEXITCODE) { throw "Patch check failed: $($patch.Name)" }
+            & git -C $source apply --whitespace=nowarn $patch.FullName
+            if ($LASTEXITCODE) { throw "Patch failed: $($patch.Name)" }
+          }
+          & git -C $source diff --stat
+
+      - name: Prepare short source path and record commits
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $builder = $env:GITHUB_WORKSPACE
+          $source = Join-Path $builder 'security-source'
+          if (Test-Path -LiteralPath $env:PHP72_ROOT) {
+            throw "Build directory already exists: $env:PHP72_ROOT"
+          }
+          New-Item -ItemType Directory -Path $env:PHP72_ROOT | Out-Null
+          New-Item -ItemType Directory -Path $env:PHP72_LOG_DIR | Out-Null
+          New-Item -ItemType Directory -Path "$env:PHP72_ROOT\php-src" | Out-Null
+          $sourceCommit = (& git -C $source rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read PHP source commit' }
+          $builderCommit = (& git -C $builder rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read builder commit' }
+          Get-ChildItem -LiteralPath $source -Force |
+            Where-Object Name -ne '.git' |
+            Copy-Item -Destination "$env:PHP72_ROOT\php-src" -Recurse -Force
+          # Version suffix describes a community patched release, not an official release.
+          $versionHeader = "$env:PHP72_ROOT\php-src\main\php_version.h"
+          $header = Get-Content $versionHeader -Raw
+          if ($header -notmatch '#define PHP_VERSION "7\.2\.34"' -or $header -notmatch '#define PHP_VERSION_ID 70234') {
+            throw 'Expected pristine PHP 7.2.34 version metadata'
+          }
+          Copy-Item $versionHeader "$env:PHP72_LOG_DIR\php_version.original.h"
+          $header = $header -replace '(?m)^#define PHP_EXTRA_VERSION "[^"]*"', '#define PHP_EXTRA_VERSION "-cve2026"'
+          $header = $header -replace '(?m)^#define PHP_VERSION "[^"]*"', '#define PHP_VERSION "7.2.34-cve2026"'
+          [IO.File]::WriteAllText($versionHeader, $header, [Text.Encoding]::ASCII)
+          $configurePath = "$env:PHP72_ROOT\php-src\configure.ac"
+          $configure = Get-Content $configurePath -Raw
+          if ($configure -notmatch '(?m)^PHP_EXTRA_VERSION="[^"]*"') { throw 'Missing configure version metadata' }
+          $configure = $configure -replace '(?m)^PHP_EXTRA_VERSION="[^"]*"', 'PHP_EXTRA_VERSION="-cve2026"'
+          [IO.File]::WriteAllText($configurePath, $configure, [Text.Encoding]::ASCII)
+          $displayVersion = '7.2.34-cve2026'
+          $versionId = 70234
+          Copy-Item $versionHeader "$env:PHP72_LOG_DIR\php_version.synchronized.h"
+
+          [ordered]@{
+            source_repository = 'https://github.com/php/php-src'
+            source_ref = $env:PHP72_SOURCE_REF
+            source_commit = $sourceCommit
+            builder_repository = $env:GITHUB_REPOSITORY
+            builder_commit = $builderCommit
+            workflow_ref = $env:GITHUB_WORKFLOW_REF
+            architecture = 'x64'
+            thread_safety = 'TS'
+            compiler_family = 'VC15 / v141'
+            apache_module = 'php7apache2_4.dll'
+            excluded = @('snmp')
+            pgo = $false
+            expected_runtime_version = $displayVersion
+            expected_runtime_version_id = $versionId
+            version_metadata_update = 'Community backport suffix in php_version.h and configure.ac'
+            patch_repository = 'https://github.com/meuhland/php-legacy-windows-builds'
+            patch_commit = '01c04b75b6bcb8eb1730e639be50ff707ef0fc01'
+            patch_series = @((Get-ChildItem "$env:GITHUB_WORKSPACE\legacy-patches\patches\7.2\*.patch" | Sort-Object Name).Name)
+          } | ConvertTo-Json -Depth 5 |
+            Set-Content "$env:PHP72_LOG_DIR\build-manifest.json" -Encoding utf8
+
+      - name: Configure the official builder for Apache and no SNMP
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $module = Join-Path $env:GITHUB_WORKSPACE 'php\BuildPhp'
+          $config = Join-Path $module 'config\vc15\x64\config.ts.bat'
+          $task = Join-Path $module 'runner\task-ts.bat'
+          foreach ($file in @($config, $task, (Join-Path $module 'public\Invoke-PhpBuild.ps1'))) {
+            if (-not (Test-Path -LiteralPath $file)) {
+              throw "Expected php-windows-builder file missing: $file"
+            }
+          }
+          $text = Get-Content -LiteralPath $config -Raw
+          if ($text -notmatch 'configure\.js' -or $text -notmatch '--enable-snapshot-build') {
+            throw 'The upstream build configuration changed; review this workflow before continuing.'
+          }
+          # Keep upstream extension defaults, but explicitly force x64 TS Apache2.4 and no SNMP.
+          # Omit PGO training so a single manual build does not need two compiler passes.
+          $text = $text -replace '"--enable-pgi"\s*', ''
+          $text = $text -replace '(?m)^([^\r\n]*configure\.js[^\r\n]*)', '$1 "--enable-zts" "--enable-apache2-4handler" "--without-snmp"'
+          [IO.File]::WriteAllText($config, $text, [Text.Encoding]::ASCII)
+          Copy-Item -LiteralPath $config -Destination "$env:PHP72_LOG_DIR\config.ts.bat"
+          $batch = @'
+          @echo off
+          setlocal
+          set "LDFLAGS=/d2:-AllowCompatibleILVersions"
+          call buildconf.bat > "%PHP72_LOG_DIR%\buildconf.log" 2>&1
+          if errorlevel 1 exit /b 1
+          call config.ts.bat > "%PHP72_LOG_DIR%\configure.log" 2>&1
+          if errorlevel 1 exit /b 2
+          findstr /C:"php7apache2_4.dll" Makefile >nul
+          if errorlevel 1 exit /b 11
+          findstr /R /C:"^EXT_TARGETS=.*php_snmp.dll" Makefile >nul
+          if not errorlevel 1 exit /b 12
+          nmake /nologo > "%PHP72_LOG_DIR%\build.log" 2>&1
+          if errorlevel 1 exit /b 3
+          nmake /nologo snap > "%PHP72_LOG_DIR%\package.log" 2>&1
+          if errorlevel 1 exit /b 4
+          exit /b 0
+          '@
+          $batch = $batch.Replace("`r`n", "`n").Replace("`n", "`r`n")
+          [IO.File]::WriteAllText($task, $batch, [Text.Encoding]::ASCII)
+          Copy-Item -LiteralPath $task -Destination "$env:PHP72_LOG_DIR\task-ts.bat"
+
+      - name: Build the checked-out source with PHP SDK
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module "$env:GITHUB_WORKSPACE\php\BuildPhp" -Force
+          Set-Location "$env:PHP72_ROOT\php-src"
+          # IMPORTANT: do not pass -PhpVersion. It would download a release instead of using this source.
+          Invoke-PhpBuild -Arch x64 -Ts ts
+
+      - name: Check the ZIP, Apache module, x64 TS core, and SNMP exclusion
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $artifacts = "$env:PHP72_ROOT\php-src\artifacts"
+          $zips = @(Get-ChildItem -LiteralPath $artifacts -Filter '*.zip' -File |
+            Where-Object Name -NotMatch '^php-(debug|devel|test)-pack-')
+          if ($zips.Count -ne 1) {
+            throw "Expected one binary ZIP, found $($zips.Count) in $artifacts"
+          }
+          $verify = "$env:PHP72_ROOT\verify"
+          Expand-Archive -LiteralPath $zips[0].FullName -DestinationPath $verify
+          foreach ($name in @('php.exe', 'php7ts.dll', 'php7apache2_4.dll')) {
+            $file = Join-Path $verify $name
+            if (-not (Test-Path -LiteralPath $file)) { throw "Required binary missing: $name" }
+            $data = [IO.File]::ReadAllBytes($file)
+            $pe = [BitConverter]::ToInt32($data, 0x3c)
+            if ([BitConverter]::ToUInt32($data, $pe) -ne 0x00004550 -or
+                [BitConverter]::ToUInt16($data, ($pe + 4)) -ne 0x8664) {
+              throw "Not a valid x64 PE binary: $name"
+            }
+          }
+          if (@(Get-ChildItem -LiteralPath $verify -Filter 'php_snmp.dll' -File -Recurse).Count) {
+            throw 'SNMP DLL unexpectedly included in the package'
+          }
+          $env:PATH = "$verify;$env:PATH"
+          $scan = "$env:PHP72_ROOT\empty-ini-scan"
+          New-Item -ItemType Directory -Path $scan | Out-Null
+          $env:PHP_INI_SCAN_DIR = $scan
+          $test = @'
+          <?php
+          if (PHP_VERSION !== '7.2.34-cve2026' || PHP_VERSION_ID !== 70234 || PHP_INT_SIZE !== 8 || PHP_ZTS !== 1 || extension_loaded('snmp')) { exit(2); }
+          echo json_encode(array('version'=>PHP_VERSION,'version_id'=>PHP_VERSION_ID,'bits'=>PHP_INT_SIZE*8,'zts'=>PHP_ZTS,'snmp'=>extension_loaded('snmp'),'builtin_modules'=>get_loaded_extensions()), JSON_PRETTY_PRINT);
+          '@
+          $testPath = "$env:PHP72_ROOT\check.php"
+          [IO.File]::WriteAllText($testPath, $test, [Text.Encoding]::ASCII)
+          $result = & "$verify\php.exe" -n $testPath
+          if ($LASTEXITCODE -ne 0) { throw "PHP x64 TS smoke check failed: $LASTEXITCODE" }
+          $runtime = ($result -join "`n") | ConvertFrom-Json
+          $runtime | ConvertTo-Json -Depth 6 |
+            Set-Content "$env:PHP72_LOG_DIR\runtime-check.json" -Encoding utf8
+          $report = Get-Content "$env:PHP72_LOG_DIR\build-manifest.json" -Raw | ConvertFrom-Json
+          $report | Add-Member -NotePropertyName runtime -NotePropertyValue $runtime
+          $report | Add-Member -NotePropertyName apache_validation -NotePropertyValue 'Module presence and x64 PE checks only; Apache server execution not tested in this workflow.'
+          $report | ConvertTo-Json -Depth 8 |
+            Set-Content "$env:PHP72_LOG_DIR\build-manifest.json" -Encoding utf8
+          $deliverables = "$env:PHP72_ROOT\deliverables"
+          New-Item -ItemType Directory -Path $deliverables | Out-Null
+          $name = $zips[0].BaseName + '-CVE-2026-109618-109619.zip'
+          Copy-Item -LiteralPath $zips[0].FullName -Destination (Join-Path $deliverables $name)
+          $hash = (Get-FileHash -LiteralPath (Join-Path $deliverables $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $name" | Set-Content "$deliverables\SHA256SUMS.txt" -Encoding ascii
+          Copy-Item "$env:PHP72_LOG_DIR\build-manifest.json" $deliverables
+          $readme = @'
+          Custom Windows x64 TS VC15 build of PHP security branch php-7.2.34.
+          This is not an official PHP Group Windows release. Community backport from meuhland/php-legacy-windows-builds; PHP 7.2.34-cve2026 / PHP_VERSION_ID 70234.
+          Apache 2.4 module: php7apache2_4.dll. Use a compatible x64 Apache and x64 Visual C++ runtime.
+          SNMP is excluded. The official builder's other snapshot defaults are retained; optional SDK availability can affect extension coverage.
+          Checks: x64 PE headers, required module files, PHP 7.2/x64/TS CLI startup, and SNMP exclusion.
+          Apache server startup, shared-extension loading and application/database integration require deployment testing.
+          The two-CVE backport is not a claim that every historical PHP 7.2 vulnerability is fixed.
+          Commit IDs and the exact runtime version are recorded in build-manifest.json. Verify the ZIP against SHA256SUMS.txt.
+          '@
+          Set-Content "$deliverables\README.txt" -Value $readme -Encoding utf8
+          "### PHP 7.2 x64 TS build" >> $env:GITHUB_STEP_SUMMARY
+          "- Source: $($report.source_commit)" >> $env:GITHUB_STEP_SUMMARY
+          "- Runtime: $($runtime.version), x64, TS" >> $env:GITHUB_STEP_SUMMARY
+          "- Apache2.4 module: present; SNMP: excluded" >> $env:GITHUB_STEP_SUMMARY
+          "- ZIP SHA256: $hash" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload binary ZIP and provenance
+        uses: actions/upload-artifact@v7
+        with:
+          name: php72-cve2026-vc15-x64-ts
+          path: C:\p72\deliverables\*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload build logs even on failure
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: php72-cve2026-build-logs
+          path: C:\p72\logs\*
+          if-no-files-found: ignore
+          retention-days: 7
