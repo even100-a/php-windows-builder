@@ -1,5 +1,5 @@
-name: Build PHP 7.4 x64 TS Apache (CVE patched)
-run-name: PHP74-CVE-x64-TS-Apache
+name: Build PHP 5.6 x64 NTS IIS (CVE patched)
+run-name: PHP56-CVE-x64-NTS-IIS
 
 on:
   workflow_dispatch:
@@ -15,233 +15,114 @@ jobs:
       run:
         shell: pwsh
     env:
-      PHP74_SOURCE_REF: PHP-7.4-CVE-2026-109618-109619
-      PHP74_ROOT: C:\p74
-      PHP74_LOG_DIR: C:\p74\logs
-      PHP_BUILD_PROVIDER: Custom build from php/php-src security branch
-      SBOM: 'false'
+      PHP56_ROOT: C:\p56
+      PHP56_LOGS: C:\p56-logs
+      PATCH_COMMIT: 01c04b75b6bcb8eb1730e639be50ff707ef0fc01
 
     steps:
-      # Put this workflow in a fork of php/php-windows-builder.
-      - name: Checkout your builder fork
+      - name: Checkout pinned PHP 5.6 backports and build script
         uses: actions/checkout@v6
         with:
+          repository: meuhland/php-legacy-windows-builds
+          ref: 01c04b75b6bcb8eb1730e639be50ff707ef0fc01
           persist-credentials: false
 
-      - name: Checkout the requested PHP security branch
-        uses: actions/checkout@v6
-        with:
-          repository: php/php-src
-          ref: PHP-7.4-CVE-2026-109618-109619
-          path: security-source
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Prepare short source path and record commits
+      - name: Prepare paths and verify pinned patch series
         run: |
           $ErrorActionPreference = 'Stop'
-          $builder = $env:GITHUB_WORKSPACE
-          $source = Join-Path $builder 'security-source'
-          if (Test-Path -LiteralPath $env:PHP74_ROOT) {
-            throw "Build directory already exists: $env:PHP74_ROOT"
+          foreach ($path in @($env:PHP56_ROOT, $env:PHP56_LOGS)) {
+            if (Test-Path -LiteralPath $path) { throw "Build path already exists: $path" }
+            New-Item -ItemType Directory -Path $path | Out-Null
           }
-          New-Item -ItemType Directory -Path $env:PHP74_ROOT | Out-Null
-          New-Item -ItemType Directory -Path $env:PHP74_LOG_DIR | Out-Null
-          New-Item -ItemType Directory -Path "$env:PHP74_ROOT\php-src" | Out-Null
-          $sourceCommit = (& git -C $source rev-parse HEAD).Trim()
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot read PHP source commit' }
-          $builderCommit = (& git -C $builder rev-parse HEAD).Trim()
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot read builder commit' }
-          Get-ChildItem -LiteralPath $source -Force |
-            Where-Object Name -ne '.git' |
-            Copy-Item -Destination "$env:PHP74_ROOT\php-src" -Recurse -Force
-          $configure = Get-Content "$env:PHP74_ROOT\php-src\configure.ac" -Raw
-          if ($configure -notmatch 'AC_INIT\(\[PHP\],\[7\.4\.') {
-            throw 'The selected source is not PHP 7.4'
+          $commit = (& git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -or $commit -ne $env:PATCH_COMMIT) { throw 'Unexpected patch repository commit' }
+          $patches = @(Get-ChildItem patches/5.6/*.patch | Sort-Object Name)
+          if ($patches.Count -ne 3) { throw 'Expected exactly three PHP 5.6 patches' }
+          $patches | Get-FileHash -Algorithm SHA256 |
+            Select-Object Path, Hash | ConvertTo-Json |
+            Set-Content "$env:PHP56_LOGS\patch-hashes.json"
+          Copy-Item patches/5.6 "$env:PHP56_LOGS\patches" -Recurse
+          Copy-Item build.ps1 "$env:PHP56_LOGS\upstream-build.ps1"
+
+      - name: Install Microsoft VC11 and Update 5 from official offline media
+        timeout-minutes: 65
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $media = 'C:\p56-media'
+          New-Item -ItemType Directory -Path $media | Out-Null
+          $packages = @(
+            @{ Name = 'VS2012_WDX_ENU.iso'; Url = 'https://download.microsoft.com/download/1/F/5/1F519CC5-0B90-4EA3-8159-33BFB97EF4D9/VS2012_WDX_ENU.iso'; Setup = 'wdexpress_full.exe'; Version = '^11\.' },
+            @{ Name = 'VS2012.5.iso'; Url = 'https://download.microsoft.com/download/1/7/A/17A8493D-BB25-4811-8242-CCCB74EF982E/VS2012.5.iso'; Setup = 'VS2012.5.exe'; Version = '^12\.|^11\.' }
+          )
+          foreach ($package in $packages) {
+            $iso = Join-Path $media $package.Name
+            & curl.exe --fail --location --retry 3 --output $iso $package.Url
+            if ($LASTEXITCODE) { throw "Download failed: $($package.Name)" }
+            Get-FileHash $iso -Algorithm SHA256 | Format-List | Out-String |
+              Add-Content "$env:PHP56_LOGS\toolchain-media-hashes.txt"
+            $disk = Mount-DiskImage -ImagePath $iso -PassThru
+            try {
+              $volume = $disk | Get-Volume
+              if (-not $volume.DriveLetter) { throw 'Installer ISO has no drive letter' }
+              $setup = "$($volume.DriveLetter):\$($package.Setup)"
+              if (-not (Test-Path $setup)) { throw "Installer missing: $setup" }
+              $signature = Get-AuthenticodeSignature $setup
+              if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+                throw "Invalid Microsoft installer signature: $setup ($($signature.Status))"
+              }
+              $info = (Get-Item $setup).VersionInfo
+              if ($info.ProductVersion -notmatch $package.Version) { throw "Unexpected installer version: $($info.ProductVersion)" }
+              $info | Format-List ProductName, ProductVersion | Out-String |
+                Add-Content "$env:PHP56_LOGS\toolchain-installers.txt"
+              $log = "$env:PHP56_LOGS\$($package.Name).install.log"
+              $process = Start-Process -FilePath $setup -ArgumentList @('/quiet', '/norestart', '/log', $log) -WindowStyle Hidden -PassThru -Wait
+              if ($process.ExitCode -notin @(0, 3010)) { throw "Installer failed: $($package.Name), exit $($process.ExitCode). See installer log." }
+              if ($process.ExitCode -eq 3010) { Write-Warning 'Installer requested restart; compiler preflight will check whether this runner can proceed.' }
+            } finally {
+              Dismount-DiskImage -ImagePath $iso
+            }
           }
-          # BEGIN VERSION SYNC
-          # Windows does not regenerate this stale header like Unix configure does.
-          $version = [regex]::Match($configure, 'AC_INIT\(\[PHP\],\[(\d+)\.(\d+)\.(\d+)([^\]]*)\]')
-          if (-not $version.Success) { throw 'Cannot parse source version from configure.ac' }
-          $major = [int]$version.Groups[1].Value
-          $minor = [int]$version.Groups[2].Value
-          $release = [int]$version.Groups[3].Value
-          $extra = $version.Groups[4].Value
-          $displayVersion = "$major.$minor.$release$extra"
-          if ($displayVersion -ne '7.4.34-dev') {
-            throw "Expected the requested 7.4.34-dev source, found $displayVersion. Review the upstream branch."
-          }
-          $versionId = $major * 10000 + $minor * 100 + $release
-          $versionHeader = "$env:PHP74_ROOT\php-src\main\php_version.h"
-          Copy-Item -LiteralPath $versionHeader -Destination "$env:PHP74_LOG_DIR\php_version.original.h"
-          $header = @(
-            '/* automatically generated from configure.ac by the Windows workflow */',
-            '/* custom build: synchronized version metadata; security source unchanged */',
-            "#define PHP_MAJOR_VERSION $major",
-            "#define PHP_MINOR_VERSION $minor",
-            "#define PHP_RELEASE_VERSION $release",
-            ('#define PHP_EXTRA_VERSION "' + $extra + '"'),
-            ('#define PHP_VERSION "' + $displayVersion + '"'),
-            "#define PHP_VERSION_ID $versionId"
-          ) -join "`r`n"
-          [IO.File]::WriteAllText($versionHeader, $header + "`r`n", [Text.Encoding]::ASCII)
-          Copy-Item -LiteralPath $versionHeader -Destination "$env:PHP74_LOG_DIR\php_version.synchronized.h"
-          # END VERSION SYNC
+          $vs = "${env:ProgramFiles(x86)}\Microsoft Visual Studio 11.0"
+          $vcvars = Join-Path $vs 'VC\vcvarsall.bat'
+          $compiler = Join-Path $vs 'VC\bin\x86_amd64\cl.exe'
+          if (-not (Test-Path $compiler)) { $compiler = Join-Path $vs 'VC\bin\amd64\cl.exe' }
+          if (-not (Test-Path $vcvars) -or -not (Test-Path $compiler)) { throw 'VC11 x64 compiler was not installed' }
+          $version = (Get-Item $compiler).VersionInfo.FileVersion
+          if ($version -notmatch '^17\.00\.61030') { throw "Expected VS2012 Update 5 compiler 17.00.61030; found $version" }
+          "VC11 compiler: $compiler ($version)" | Set-Content "$env:PHP56_LOGS\compiler.txt"
+          "VS110COMNTOOLS=$vs\Common7\Tools\" >> $env:GITHUB_ENV
+
+      - name: Build PHP 5.6.40 backport x64 NTS without SNMP or MSSQL
+        timeout-minutes: 90
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # This pinned script checks out php-5.6.40 and applies patches/5.6 in name order.
+          & .\build.ps1 -Version '5.6' -Root $env:PHP56_ROOT -Arch x64 -Flavors NTS `
+            -VersionSuffix '-cve2026' `
+            -ExtraConfigureArgs @('--without-snmp', '--without-mssql', '--without-pdo-mssql', '--disable-apache2-4handler')
+          $src = "$env:PHP56_ROOT\phpdev\vc11\x64\php-5.6\src"
+          $sourceCommit = (& git -C $src rev-parse HEAD).Trim()
+          if ($LASTEXITCODE) { throw 'Cannot read PHP source commit' }
+          & git -C $src diff --binary | Set-Content "$env:PHP56_LOGS\applied-source.diff"
           [ordered]@{
             source_repository = 'https://github.com/php/php-src'
-            source_ref = $env:PHP74_SOURCE_REF
+            source_tag = 'php-5.6.40'
             source_commit = $sourceCommit
-            builder_repository = $env:GITHUB_REPOSITORY
-            builder_commit = $builderCommit
-            workflow_ref = $env:GITHUB_WORKFLOW_REF
+            patch_repository = 'https://github.com/meuhland/php-legacy-windows-builds'
+            patch_commit = $env:PATCH_COMMIT
             architecture = 'x64'
-            thread_safety = 'TS'
-            compiler_family = 'VC15 / v141'
-            apache_module = 'php7apache2_4.dll'
-            excluded = @('snmp')
-            pgo = $false
-            expected_runtime_version = $displayVersion
-            expected_runtime_version_id = $versionId
-            version_metadata_update = 'main/php_version.h synchronized from upstream configure.ac; custom build'
-          } | ConvertTo-Json -Depth 5 |
-            Set-Content "$env:PHP74_LOG_DIR\build-manifest.json" -Encoding utf8
+            thread_safety = 'NTS'
+            compiler = 'VC11 / Visual Studio 2012 Update 5'
+            runtime_version = '5.6.40-cve2026'
+            excluded = @('snmp', 'mssql', 'pdo_mssql', 'apache2-4handler')
+            target = 'IIS FastCGI / php-cgi.exe'
+            iis_server_test = 'Not performed; CLI, CGI startup and targeted PHPT checks only'
+          } | ConvertTo-Json -Depth 5 | Set-Content "$env:PHP56_LOGS\build-manifest.json"
 
-      - name: Configure the official builder for Apache and no SNMP
+      - name: Verify x64 NTS ZIP and CLI and CGI startup
         run: |
           $ErrorActionPreference = 'Stop'
-          $module = Join-Path $env:GITHUB_WORKSPACE 'php\BuildPhp'
-          $config = Join-Path $module 'config\vc15\x64\config.ts.bat'
-          $task = Join-Path $module 'runner\task-ts.bat'
-          foreach ($file in @($config, $task, (Join-Path $module 'public\Invoke-PhpBuild.ps1'))) {
-            if (-not (Test-Path -LiteralPath $file)) {
-              throw "Expected php-windows-builder file missing: $file"
-            }
-          }
-          $text = Get-Content -LiteralPath $config -Raw
-          if ($text -notmatch 'configure\.js' -or $text -notmatch '--enable-snapshot-build') {
-            throw 'The upstream build configuration changed; review this workflow before continuing.'
-          }
-          # Keep upstream extension defaults, but explicitly force x64 TS Apache2.4 and no SNMP.
-          # Omit PGO training so a single manual build does not need two compiler passes.
-          $text = $text -replace '"--enable-pgi"\s*', ''
-          $text = $text -replace '(?m)^([^\r\n]*configure\.js[^\r\n]*)', '$1 "--enable-zts" "--enable-apache2-4handler" "--without-snmp"'
-          [IO.File]::WriteAllText($config, $text, [Text.Encoding]::ASCII)
-          Copy-Item -LiteralPath $config -Destination "$env:PHP74_LOG_DIR\config.ts.bat"
-          $batch = @'
-          @echo off
-          setlocal
-          set "LDFLAGS=/d2:-AllowCompatibleILVersions"
-          call buildconf.bat > "%PHP74_LOG_DIR%\buildconf.log" 2>&1
-          if errorlevel 1 exit /b 1
-          call config.ts.bat > "%PHP74_LOG_DIR%\configure.log" 2>&1
-          if errorlevel 1 exit /b 2
-          findstr /C:"php7apache2_4.dll" Makefile >nul
-          if errorlevel 1 exit /b 11
-          findstr /R /C:"^EXT_TARGETS=.*php_snmp.dll" Makefile >nul
-          if not errorlevel 1 exit /b 12
-          nmake /nologo > "%PHP74_LOG_DIR%\build.log" 2>&1
-          if errorlevel 1 exit /b 3
-          nmake /nologo snap > "%PHP74_LOG_DIR%\package.log" 2>&1
-          if errorlevel 1 exit /b 4
-          exit /b 0
-          '@
-          $batch = $batch.Replace("`r`n", "`n").Replace("`n", "`r`n")
-          [IO.File]::WriteAllText($task, $batch, [Text.Encoding]::ASCII)
-          Copy-Item -LiteralPath $task -Destination "$env:PHP74_LOG_DIR\task-ts.bat"
-
-      - name: Build the checked-out source with PHP SDK
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Import-Module "$env:GITHUB_WORKSPACE\php\BuildPhp" -Force
-          Set-Location "$env:PHP74_ROOT\php-src"
-          # IMPORTANT: do not pass -PhpVersion. It would download a release instead of using this source.
-          Invoke-PhpBuild -Arch x64 -Ts ts
-
-      - name: Check the ZIP, Apache module, x64 TS core, and SNMP exclusion
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $artifacts = "$env:PHP74_ROOT\php-src\artifacts"
-          $zips = @(Get-ChildItem -LiteralPath $artifacts -Filter '*.zip' -File |
+          $zips = @(Get-ChildItem "$env:PHP56_ROOT\dist\php-*.zip" |
             Where-Object Name -NotMatch '^php-(debug|devel|test)-pack-')
-          if ($zips.Count -ne 1) {
-            throw "Expected one binary ZIP, found $($zips.Count) in $artifacts"
-          }
-          $verify = "$env:PHP74_ROOT\verify"
-          Expand-Archive -LiteralPath $zips[0].FullName -DestinationPath $verify
-          foreach ($name in @('php.exe', 'php7ts.dll', 'php7apache2_4.dll')) {
-            $file = Join-Path $verify $name
-            if (-not (Test-Path -LiteralPath $file)) { throw "Required binary missing: $name" }
-            $data = [IO.File]::ReadAllBytes($file)
-            $pe = [BitConverter]::ToInt32($data, 0x3c)
-            if ([BitConverter]::ToUInt32($data, $pe) -ne 0x00004550 -or
-                [BitConverter]::ToUInt16($data, ($pe + 4)) -ne 0x8664) {
-              throw "Not a valid x64 PE binary: $name"
-            }
-          }
-          if (@(Get-ChildItem -LiteralPath $verify -Filter 'php_snmp.dll' -File -Recurse).Count) {
-            throw 'SNMP DLL unexpectedly included in the package'
-          }
-          $env:PATH = "$verify;$env:PATH"
-          $scan = "$env:PHP74_ROOT\empty-ini-scan"
-          New-Item -ItemType Directory -Path $scan | Out-Null
-          $env:PHP_INI_SCAN_DIR = $scan
-          $test = @'
-          <?php
-          if (PHP_VERSION !== '7.4.34-dev' || PHP_VERSION_ID !== 70434 || PHP_INT_SIZE !== 8 || PHP_ZTS !== 1 || extension_loaded('snmp')) { exit(2); }
-          echo json_encode(array('version'=>PHP_VERSION,'version_id'=>PHP_VERSION_ID,'bits'=>PHP_INT_SIZE*8,'zts'=>PHP_ZTS,'snmp'=>extension_loaded('snmp'),'builtin_modules'=>get_loaded_extensions()), JSON_PRETTY_PRINT);
-          '@
-          $testPath = "$env:PHP74_ROOT\check.php"
-          [IO.File]::WriteAllText($testPath, $test, [Text.Encoding]::ASCII)
-          $result = & "$verify\php.exe" -n $testPath
-          if ($LASTEXITCODE -ne 0) { throw "PHP x64 TS smoke check failed: $LASTEXITCODE" }
-          $runtime = ($result -join "`n") | ConvertFrom-Json
-          $runtime | ConvertTo-Json -Depth 6 |
-            Set-Content "$env:PHP74_LOG_DIR\runtime-check.json" -Encoding utf8
-          $report = Get-Content "$env:PHP74_LOG_DIR\build-manifest.json" -Raw | ConvertFrom-Json
-          $report | Add-Member -NotePropertyName runtime -NotePropertyValue $runtime
-          $report | Add-Member -NotePropertyName apache_validation -NotePropertyValue 'Module presence and x64 PE checks only; Apache server execution not tested in this workflow.'
-          $report | ConvertTo-Json -Depth 8 |
-            Set-Content "$env:PHP74_LOG_DIR\build-manifest.json" -Encoding utf8
-          $deliverables = "$env:PHP74_ROOT\deliverables"
-          New-Item -ItemType Directory -Path $deliverables | Out-Null
-          $name = $zips[0].BaseName + '-CVE-2026-109618-109619.zip'
-          Copy-Item -LiteralPath $zips[0].FullName -Destination (Join-Path $deliverables $name)
-          $hash = (Get-FileHash -LiteralPath (Join-Path $deliverables $name) -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  $name" | Set-Content "$deliverables\SHA256SUMS.txt" -Encoding ascii
-          Copy-Item "$env:PHP74_LOG_DIR\build-manifest.json" $deliverables
-          $readme = @'
-          Custom Windows x64 TS VC15 build of PHP security branch PHP-7.4-CVE-2026-109618-109619.
-          This is not an official PHP Group Windows release. The stale Windows version header is synchronized with configure.ac: 7.4.34-dev / PHP_VERSION_ID 70434.
-          Apache 2.4 module: php7apache2_4.dll. Use a compatible x64 Apache and x64 Visual C++ runtime.
-          SNMP is excluded. The official builder's other snapshot defaults are retained; optional SDK availability can affect extension coverage.
-          Checks: x64 PE headers, required module files, PHP 7.4/x64/TS CLI startup, and SNMP exclusion.
-          Apache server startup, shared-extension loading and application/database integration require deployment testing.
-          The two-CVE backport is not a claim that every historical PHP 7.4 vulnerability is fixed.
-          Commit IDs and the exact runtime version are recorded in build-manifest.json. Verify the ZIP against SHA256SUMS.txt.
-          '@
-          Set-Content "$deliverables\README.txt" -Value $readme -Encoding utf8
-          "### PHP 7.4 x64 TS build" >> $env:GITHUB_STEP_SUMMARY
-          "- Source: $($report.source_commit)" >> $env:GITHUB_STEP_SUMMARY
-          "- Runtime: $($runtime.version), x64, TS" >> $env:GITHUB_STEP_SUMMARY
-          "- Apache2.4 module: present; SNMP: excluded" >> $env:GITHUB_STEP_SUMMARY
-          "- ZIP SHA256: $hash" >> $env:GITHUB_STEP_SUMMARY
-
-      - name: Upload binary ZIP and provenance
-        uses: actions/upload-artifact@v7
-        with:
-          name: php74-cve2026-vc15-x64-ts
-          path: C:\p74\deliverables\*
-          if-no-files-found: error
-          retention-days: 7
-          compression-level: 0
-
-      - name: Upload build logs even on failure
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: php74-cve2026-build-logs
-          path: C:\p74\logs\*
-          if-no-files-found: ignore
-          retention-days: 7
+          if ($zips.Count -ne 1) { throw "Expected one binary ZIP, found $($zips.Count)" }
+          $verify = "$env:PHP56_ROOT\verify"
