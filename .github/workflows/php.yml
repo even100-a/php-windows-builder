@@ -59,6 +59,34 @@ jobs:
           if ($configure -notmatch 'AC_INIT\(\[PHP\],\[7\.4\.') {
             throw 'The selected source is not PHP 7.4'
           }
+          # BEGIN VERSION SYNC
+          # Windows does not regenerate this stale header like Unix configure does.
+          $version = [regex]::Match($configure, 'AC_INIT\(\[PHP\],\[(\d+)\.(\d+)\.(\d+)([^\]]*)\]')
+          if (-not $version.Success) { throw 'Cannot parse source version from configure.ac' }
+          $major = [int]$version.Groups[1].Value
+          $minor = [int]$version.Groups[2].Value
+          $release = [int]$version.Groups[3].Value
+          $extra = $version.Groups[4].Value
+          $displayVersion = "$major.$minor.$release$extra"
+          if ($displayVersion -ne '7.4.34-dev') {
+            throw "Expected the requested 7.4.34-dev source, found $displayVersion. Review the upstream branch."
+          }
+          $versionId = $major * 10000 + $minor * 100 + $release
+          $versionHeader = "$env:PHP74_ROOT\php-src\main\php_version.h"
+          Copy-Item -LiteralPath $versionHeader -Destination "$env:PHP74_LOG_DIR\php_version.original.h"
+          $header = @(
+            '/* automatically generated from configure.ac by the Windows workflow */',
+            '/* custom build: synchronized version metadata; security source unchanged */',
+            "#define PHP_MAJOR_VERSION $major",
+            "#define PHP_MINOR_VERSION $minor",
+            "#define PHP_RELEASE_VERSION $release",
+            ('#define PHP_EXTRA_VERSION "' + $extra + '"'),
+            ('#define PHP_VERSION "' + $displayVersion + '"'),
+            "#define PHP_VERSION_ID $versionId"
+          ) -join "`r`n"
+          [IO.File]::WriteAllText($versionHeader, $header + "`r`n", [Text.Encoding]::ASCII)
+          Copy-Item -LiteralPath $versionHeader -Destination "$env:PHP74_LOG_DIR\php_version.synchronized.h"
+          # END VERSION SYNC
           [ordered]@{
             source_repository = 'https://github.com/php/php-src'
             source_ref = $env:PHP74_SOURCE_REF
@@ -72,6 +100,9 @@ jobs:
             apache_module = 'php7apache2_4.dll'
             excluded = @('snmp')
             pgo = $false
+            expected_runtime_version = $displayVersion
+            expected_runtime_version_id = $versionId
+            version_metadata_update = 'main/php_version.h synchronized from upstream configure.ac; custom build'
           } | ConvertTo-Json -Depth 5 |
             Set-Content "$env:PHP74_LOG_DIR\build-manifest.json" -Encoding utf8
 
@@ -158,8 +189,8 @@ jobs:
           $env:PHP_INI_SCAN_DIR = $scan
           $test = @'
           <?php
-          if (PHP_MAJOR_VERSION !== 7 || PHP_MINOR_VERSION !== 4 || PHP_INT_SIZE !== 8 || PHP_ZTS !== 1 || extension_loaded('snmp')) { exit(2); }
-          echo json_encode(array('version'=>PHP_VERSION,'bits'=>PHP_INT_SIZE*8,'zts'=>PHP_ZTS,'snmp'=>extension_loaded('snmp'),'builtin_modules'=>get_loaded_extensions()), JSON_PRETTY_PRINT);
+          if (PHP_VERSION !== '7.4.34-dev' || PHP_VERSION_ID !== 70434 || PHP_INT_SIZE !== 8 || PHP_ZTS !== 1 || extension_loaded('snmp')) { exit(2); }
+          echo json_encode(array('version'=>PHP_VERSION,'version_id'=>PHP_VERSION_ID,'bits'=>PHP_INT_SIZE*8,'zts'=>PHP_ZTS,'snmp'=>extension_loaded('snmp'),'builtin_modules'=>get_loaded_extensions()), JSON_PRETTY_PRINT);
           '@
           $testPath = "$env:PHP74_ROOT\check.php"
           [IO.File]::WriteAllText($testPath, $test, [Text.Encoding]::ASCII)
@@ -182,7 +213,7 @@ jobs:
           Copy-Item "$env:PHP74_LOG_DIR\build-manifest.json" $deliverables
           $readme = @'
           Custom Windows x64 TS VC15 build of PHP security branch PHP-7.4-CVE-2026-109618-109619.
-          This is not an official PHP Group Windows release. The original branch version string is preserved.
+          This is not an official PHP Group Windows release. The stale Windows version header is synchronized with configure.ac: 7.4.34-dev / PHP_VERSION_ID 70434.
           Apache 2.4 module: php7apache2_4.dll. Use a compatible x64 Apache and x64 Visual C++ runtime.
           SNMP is excluded. The official builder's other snapshot defaults are retained; optional SDK availability can affect extension coverage.
           Checks: x64 PE headers, required module files, PHP 7.4/x64/TS CLI startup, and SNMP exclusion.
